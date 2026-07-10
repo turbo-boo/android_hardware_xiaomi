@@ -43,7 +43,12 @@ static const fingerprint_hal_t kModules[] = {
 static const uint16_t kVersion = HARDWARE_MODULE_API_VERSION(2, 1);
 static Fingerprint* sInstance;
 
-Fingerprint::Fingerprint(std::shared_ptr<FingerprintConfig> config) : mConfig(std::move(config)) {
+Fingerprint::Fingerprint(std::shared_ptr<FingerprintConfig> config)
+    : mConfig(std::move(config)),
+      mSensorType(FingerprintSensorType::UNKNOWN),
+      mDevice(nullptr),
+      mUdfpsHandlerFactory(nullptr),
+      mUdfpsHandler(nullptr) {
     sInstance = this;  // keep track of the most recent instance
 
     if (mDevice) {
@@ -244,6 +249,11 @@ ndk::ScopedAStatus Fingerprint::createSession(int32_t /*sensorId*/, int32_t user
                                               const std::shared_ptr<ISessionCallback>& cb,
                                               std::shared_ptr<ISession>* out) {
     CHECK(mSession == nullptr || mSession->isClosed()) << "Open session already exists!";
+
+    if (mDevice == nullptr) {
+        ALOGE("Cannot create session without a fingerprint backend");
+        return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
+    }
 
     mSession = SharedRefBase::make<Session>(mDevice, mUdfpsHandler, userId, cb, mLockoutTracker);
     *out = mSession;
