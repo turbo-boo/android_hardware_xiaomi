@@ -380,9 +380,7 @@ void Session::notify(const fingerprint_msg_t* msg) {
             // don't process vendor messages further since frameworks try to disable
             // udfps display mode on vendor acquired messages but our sensors send a
             // vendor message during processing...
-            if (result != AcquiredInfo::VENDOR ||
-                (mUdfpsHandler && mUdfpsHandler->shouldForwardAcquired(
-                                          static_cast<int32_t>(result), vendorCode))) {
+            if (result != AcquiredInfo::VENDOR) {
                 mCb->onAcquired(result, vendorCode);
             }
         } break;
