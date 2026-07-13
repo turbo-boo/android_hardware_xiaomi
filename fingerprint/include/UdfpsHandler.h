@@ -23,6 +23,7 @@ class UdfpsHandler {
     virtual void onUiReady() {};
 
     virtual void onAcquired(int32_t result, int32_t vendorCode) {};
+    virtual bool shouldForwardAcquired(int32_t result, int32_t vendorCode) { return false; };
     virtual void onAuthenticationSucceeded() {};
     virtual void onAuthenticationFailed() {};
     virtual void cancel() {};
