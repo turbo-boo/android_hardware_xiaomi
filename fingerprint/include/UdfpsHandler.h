@@ -21,8 +21,12 @@ class UdfpsHandler {
     virtual void onFingerDown(uint32_t x, uint32_t y, float minor, float major) {};
     virtual void onFingerUp() {};
     virtual void onUiReady() {};
+    virtual void onEnrollStarted() {};
+    virtual void onAuthenticateStarted() {};
 
     virtual void onAcquired(int32_t result, int32_t vendorCode) {};
+    virtual void onEnrollmentProgress(uint32_t remaining) {};
+    virtual void onError() {};
     virtual bool shouldForwardAcquired(int32_t result, int32_t vendorCode) { return false; };
     virtual void onAuthenticationSucceeded() {};
     virtual void onAuthenticationFailed() {};
