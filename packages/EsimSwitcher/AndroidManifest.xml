@@ -40,6 +40,7 @@
         <activity
             android:name=".EsimSettingsActivity"
             android:configChanges="orientation|screenSize"
+            android:enabled="false"
             android:exported="true"
             android:label="@string/esim_title">
             <intent-filter>
