@@ -9,6 +9,8 @@
     android:versionCode="1"
     android:versionName="1.0"
     android:sharedUserId="android.uid.system">
+    <uses-permission android:name="android.permission.MODIFY_PHONE_STATE" />
+    <uses-permission android:name="android.permission.READ_PRIVILEGED_PHONE_STATE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
@@ -19,13 +21,8 @@
         android:theme="@style/Theme.SubSettingsBase.Expressive">
 
         <uses-library
-            android:name="com.qualcomm.qcrilhook"
-            android:exported="true"
-            android:required="false"/>
-        <uses-library
             android:name="com.qti.extphone.extphonelib"
-            android:exported="true"
-            android:required="false"/>
+            android:required="true" />
 
         <receiver
             android:name=".BootCompletedReceiver"

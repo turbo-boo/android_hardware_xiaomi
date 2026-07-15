@@ -11,6 +11,7 @@
     <com.android.settingslib.widget.MainSwitchPreference
         android:key="esim_enable"
         android:title="@string/esim_enable_name"
+        android:persistent="false"
         android:enabled="false" />
 
     <com.android.settingslib.widget.FooterPreference

@@ -12,14 +12,16 @@ android_app {
     privileged: true,
     privapp_allowlist: "privapp_whitelist_com.xiaomi.mtb.xml",
     system_ext_specific: true,
+    libs: [
+        "extphonelib",
+    ],
     static_libs: [
         "androidx.core_core",
         "androidx.preference_preference",
         "org.lineageos.settings.resources",
         "SettingsLib",
     ],
-    optional_uses_libs: [
-        "com.qualcomm.qcrilhook",
+    uses_libs: [
         "com.qti.extphone.extphonelib",
     ],
 }
