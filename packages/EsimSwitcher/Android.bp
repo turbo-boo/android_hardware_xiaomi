@@ -22,6 +22,6 @@ android_app {
         "SettingsLib",
     ],
     uses_libs: [
-        "com.qti.extphone.extphonelib",
+        "extphonelib",
     ],
 }
