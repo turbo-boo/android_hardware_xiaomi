@@ -25,10 +25,23 @@ vintf_fragment {
     vendor: true,
 }
 
-cc_binary {
+soong_config_module_type {
+    name: "xiaomi_sensors_cc_binary",
+    module_type: "cc_binary",
+    config_namespace: "xiaomi_display",
+    bool_variables: ["dual_als_fusion"],
+    properties: ["cflags"],
+}
+
+xiaomi_sensors_cc_binary {
     name: "android.hardware.sensors-service.xiaomi-multihal",
     vendor: true,
     relative_install_path: "hw",
+    soong_config_variables: {
+        dual_als_fusion: {
+            cflags: ["-DXIAOMI_DUAL_ALS_FUSION"],
+        },
+    },
     srcs: [
         "service.cpp",
         "HalProxy.cpp",
