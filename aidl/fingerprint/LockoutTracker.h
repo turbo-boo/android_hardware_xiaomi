@@ -19,10 +19,11 @@ namespace aidl::android::hardware::biometrics::fingerprint {
 
 class LockoutTracker {
   public:
-    LockoutTracker() : mFailedCount(0) {}
-    ~LockoutTracker() {}
-
     enum class LockoutMode : int8_t { kNone = 0, kTimed, kPermanent };
+
+    LockoutTracker()
+        : mFailedCount(0), mLockoutTimedStart(0), mCurrentMode(LockoutMode::kNone) {}
+    ~LockoutTracker() {}
 
     void reset(bool clearAttemptCounter);
     LockoutMode getMode();
