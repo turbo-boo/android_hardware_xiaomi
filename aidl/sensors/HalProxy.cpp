@@ -1576,52 +1576,102 @@ void HalProxy::resetSharedWakelock() {
 void HalProxy::postEventsToMessageQueue(const std::vector<Event>& events, size_t numWakeupEvents,
                                         V2_0::implementation::ScopedWakelock wakelock) {
 #if defined(XIAOMI_DUAL_ALS_FUSION)
-    std::vector<Event> eventsToPost(events);
-    {
-        std::lock_guard<std::mutex> fusedAlsLock(gFusedAlsMutex);
-        if (gFusedAls.active) {
-            bool sourceEventSeen = false;
-            int64_t latestTimestamp = 0;
-            for (const Event& event : events) {
-                if (event.sensorHandle != gFusedAls.frontHandle &&
-                    event.sensorHandle != gFusedAls.backHandle) {
-                    continue;
-                }
+    std::unique_lock<std::mutex> fusedAlsLock(gFusedAlsMutex);
+    std::vector<Event> eventsToPost;
+    eventsToPost.reserve(events.size() * 2);
+    for (const Event& event : events) {
+        const bool isFront = gFusedAls.configured &&
+                event.sensorHandle == gFusedAls.frontHandle;
+        const bool isBack = gFusedAls.configured &&
+                event.sensorHandle == gFusedAls.backHandle;
+        if (!isFront && !isBack) {
+            eventsToPost.push_back(event);
+            continue;
+        }
 
-                const float lux = event.sensorHandle == gFusedAls.frontHandle
-                        ? event.u.scalar
-                        : event.u.data[0];
-                if (!std::isfinite(lux) || lux < 0.0f) {
-                    continue;
-                }
-
-                sourceEventSeen = true;
-                latestTimestamp = std::max(latestTimestamp, event.timestamp);
-                if (event.sensorHandle == gFusedAls.frontHandle) {
-                    gFusedAls.frontLux = lux;
-                    gFusedAls.frontValueValid = true;
+        const bool externallyActive = isFront ? gFusedAls.frontExternallyActive
+                                              : gFusedAls.backExternallyActive;
+        const bool externalEnabling = isFront ? gFusedAls.frontExternalEnabling
+                                              : gFusedAls.backExternalEnabling;
+        const bool isFlushComplete = event.sensorType == V2_1::SensorType::META_DATA &&
+                event.u.meta.what == V1_0::MetaDataEventType::META_DATA_FLUSH_COMPLETE;
+        if (isFlushComplete) {
+            std::deque<FlushRequest>& requests = isFront ? gFusedAls.frontFlushRequests
+                                                         : gFusedAls.backFlushRequests;
+            if (requests.empty()) {
+                if (externallyActive) eventsToPost.push_back(event);
+            } else {
+                const FlushRequest request = requests.front();
+                requests.pop_front();
+                if (!request.fused) {
+                    eventsToPost.push_back(event);
                 } else {
-                    gFusedAls.backLux = lux;
-                    gFusedAls.backValueValid = true;
+                    auto fusedRequest = std::find_if(
+                            gFusedAls.fusedFlushRequests.begin(),
+                            gFusedAls.fusedFlushRequests.end(),
+                            [&request](const FusedFlushRequest& pending) {
+                                return pending.id == request.id;
+                            });
+                    if (fusedRequest != gFusedAls.fusedFlushRequests.end()) {
+                        if (isFront) {
+                            fusedRequest->frontComplete = true;
+                        } else {
+                            fusedRequest->backComplete = true;
+                        }
+                    }
                 }
             }
 
-            if (sourceEventSeen &&
-                (gFusedAls.frontValueValid || gFusedAls.backValueValid)) {
-                const float fusedLux = gFusedAls.frontValueValid && gFusedAls.backValueValid
-                        ? std::max(gFusedAls.frontLux, gFusedAls.backLux)
-                        : gFusedAls.frontValueValid ? gFusedAls.frontLux : gFusedAls.backLux;
-                if (!gFusedAls.lastOutputValid || fusedLux != gFusedAls.lastOutputLux) {
-                    Event fusedEvent{};
-                    fusedEvent.timestamp = latestTimestamp;
-                    fusedEvent.sensorHandle = gFusedAls.fusedHandle;
-                    fusedEvent.sensorType = static_cast<V2_1::SensorType>(
-                            gFusedAls.fusedSensorType);
-                    fusedEvent.u.data[0] = fusedLux;
-                    eventsToPost.push_back(fusedEvent);
-                    gFusedAls.lastOutputLux = fusedLux;
-                    gFusedAls.lastOutputValid = true;
-                }
+            while (!gFusedAls.fusedFlushRequests.empty() &&
+                   gFusedAls.fusedFlushRequests.front().frontComplete &&
+                   gFusedAls.fusedFlushRequests.front().backComplete) {
+                Event fusedFlushComplete{};
+                fusedFlushComplete.sensorHandle = gFusedAls.fusedHandle;
+                fusedFlushComplete.sensorType = V2_1::SensorType::META_DATA;
+                fusedFlushComplete.u.meta.what =
+                        V1_0::MetaDataEventType::META_DATA_FLUSH_COMPLETE;
+                eventsToPost.push_back(fusedFlushComplete);
+                gFusedAls.fusedFlushRequests.pop_front();
+            }
+        } else if (externalEnabling) {
+            std::vector<Event>& pendingEvents = isFront
+                    ? gFusedAls.frontPendingActivationEvents
+                    : gFusedAls.backPendingActivationEvents;
+            pendingEvents.push_back(event);
+        } else if (externallyActive) {
+            eventsToPost.push_back(event);
+        }
+
+        const V2_1::SensorType expectedType = isFront ? gFusedAls.frontSensorType
+                                                      : gFusedAls.backSensorType;
+        if (event.sensorType != expectedType ||
+            !(gFusedAls.active || gFusedAls.enabling || externallyActive || externalEnabling)) {
+            continue;
+        }
+
+        const float lux = isFront ? event.u.scalar : event.u.data[0];
+        if (!std::isfinite(lux) || lux < 0.0f) continue;
+
+        bool& valueValid = isFront ? gFusedAls.frontValueValid : gFusedAls.backValueValid;
+        float& sourceLux = isFront ? gFusedAls.frontLux : gFusedAls.backLux;
+        int64_t& sourceTimestamp = isFront ? gFusedAls.frontTimestamp
+                                           : gFusedAls.backTimestamp;
+        if (valueValid && event.timestamp < sourceTimestamp) continue;
+
+        valueValid = true;
+        sourceLux = lux;
+        sourceTimestamp = event.timestamp;
+        if (!gFusedAls.active) continue;
+
+        const float fusedLux = gFusedAls.frontValueValid && gFusedAls.backValueValid
+                ? std::max(gFusedAls.frontLux, gFusedAls.backLux)
+                : gFusedAls.frontValueValid ? gFusedAls.frontLux : gFusedAls.backLux;
+        if (!gFusedAls.lastOutputValid || fusedLux != gFusedAls.lastOutputLux) {
+            Event fusedEvent = makeFusedAlsEventLocked(fusedLux, event.timestamp);
+            if (fusedEvent.sensorHandle == gFusedAls.fusedHandle) {
+                eventsToPost.push_back(fusedEvent);
+            } else {
+                ALOGE("Unable to preserve fused ALS timestamp monotonicity");
             }
         }
     }
@@ -1629,17 +1679,29 @@ void HalProxy::postEventsToMessageQueue(const std::vector<Event>& events, size_t
     const std::vector<Event>& eventsToPost = events;
 #endif
 
-    size_t numToWrite = 0;
     std::lock_guard<std::mutex> lock(mEventQueueWriteMutex);
     if (wakelock.isLocked()) {
+        // Fusion only removes non-wakeup ALS events and adds a non-wakeup virtual event.
         incrementRefCountAndMaybeAcquireWakelock(numWakeupEvents);
     }
+#if defined(XIAOMI_DUAL_ALS_FUSION)
+    size_t droppedWakeupEvents = 0;
+    if (!enqueueEventsLocked(eventsToPost, mEventQueue.get(), mEventQueueFlag, mSensors,
+                             &mPendingWriteEventsQueue, &mSizePendingWriteEventsQueue,
+                             &mMostEventsObservedPendingWriteEventsQueue,
+                             kMaxSizePendingWriteEventsQueue, &mEventQueueWriteCV,
+                             &droppedWakeupEvents)) {
+        if (droppedWakeupEvents > 0) {
+            decrementRefCountAndMaybeReleaseWakelock(droppedWakeupEvents);
+        }
+        ALOGE("Dropping sensor events because the pending event queue is full");
+    }
+#else
+    size_t numToWrite = 0;
     if (mPendingWriteEventsQueue.empty()) {
         numToWrite = std::min(eventsToPost.size(), mEventQueue->availableToWrite());
         if (numToWrite > 0) {
             if (mEventQueue->write(eventsToPost.data(), numToWrite)) {
-                // TODO(b/143302327): While loop if mEventQueue->avaiableToWrite > 0 to possibly fit
-                // in more writes immediately
                 mEventQueueFlag->wake(static_cast<uint32_t>(EventQueueFlagBits::READ_AND_PROCESS));
             } else {
                 numToWrite = 0;
@@ -1656,6 +1718,7 @@ void HalProxy::postEventsToMessageQueue(const std::vector<Event>& events, size_t
                 std::max(mMostEventsObservedPendingWriteEventsQueue, mSizePendingWriteEventsQueue);
         mEventQueueWriteCV.notify_one();
     }
+#endif
 }
 
 bool HalProxy::incrementRefCountAndMaybeAcquireWakelock(size_t delta,
