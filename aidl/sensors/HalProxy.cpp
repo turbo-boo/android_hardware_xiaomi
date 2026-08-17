@@ -883,23 +883,119 @@ Return<Result> HalProxy::initializeCommon(
 Return<Result> HalProxy::batch(int32_t sensorHandle, int64_t samplingPeriodNs,
                                int64_t maxReportLatencyNs) {
 #if defined(XIAOMI_DUAL_ALS_FUSION)
-    int32_t frontAlsHandle = -1;
-    int32_t backAlsHandle = -1;
+    bool isFusedAls = false;
+    bool isFusedAlsSource = false;
+    bool sourceIsFront = false;
     {
         std::lock_guard<std::mutex> lock(gFusedAlsMutex);
         if (gFusedAls.configured && sensorHandle == gFusedAls.fusedHandle) {
-            frontAlsHandle = gFusedAls.frontHandle;
-            backAlsHandle = gFusedAls.backHandle;
+            isFusedAls = true;
+        } else if (gFusedAls.configured && sensorHandle == gFusedAls.frontHandle) {
+            isFusedAlsSource = true;
+            sourceIsFront = true;
+        } else if (gFusedAls.configured && sensorHandle == gFusedAls.backHandle) {
+            isFusedAlsSource = true;
         }
     }
-    if (frontAlsHandle != -1) {
-        Result result = getSubHalForSensorHandle(frontAlsHandle)->batch(
-                clearSubHalIndex(frontAlsHandle), samplingPeriodNs, maxReportLatencyNs);
-        if (result != Result::OK) {
-            return result;
+
+    if (isFusedAls || isFusedAlsSource) {
+        if (samplingPeriodNs < 0 || maxReportLatencyNs < 0) return Result::BAD_VALUE;
+
+        std::lock_guard<std::recursive_mutex> controlLock(gFusedAlsControlMutex);
+        FusedAlsState oldState;
+        {
+            std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+            oldState = gFusedAls;
         }
-        return getSubHalForSensorHandle(backAlsHandle)->batch(
-                clearSubHalIndex(backAlsHandle), samplingPeriodNs, maxReportLatencyNs);
+
+        const BatchParams requested{
+                true,
+                samplingPeriodNs,
+                isFusedAls ? 0 : maxReportLatencyNs,
+        };
+        auto programBatch = [this](int32_t sourceHandle, const BatchParams& params) -> Result {
+            return getSubHalForSensorHandle(sourceHandle)->batch(
+                    clearSubHalIndex(sourceHandle), params.samplingPeriodNs,
+                    params.maxReportLatencyNs);
+        };
+
+        if (isFusedAls) {
+            // Do not disturb an active physical client until the fused sensor is activated.
+            if (!oldState.active &&
+                (oldState.frontExternallyActive || oldState.backExternallyActive)) {
+                std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+                gFusedAls.fusedBatch = requested;
+                return Result::OK;
+            }
+
+            const BatchParams frontEffective = combineBatchParams(
+                    requested,
+                    oldState.frontExternallyActive ? oldState.frontExternalBatch : BatchParams{});
+            const BatchParams backEffective = combineBatchParams(
+                    requested,
+                    oldState.backExternallyActive ? oldState.backExternalBatch : BatchParams{});
+            BatchParams frontProgrammed = oldState.frontProgrammedBatch;
+            BatchParams backProgrammed = oldState.backProgrammedBatch;
+
+            if (!batchParamsEqual(frontEffective, frontProgrammed)) {
+                Result result = programBatch(oldState.frontHandle, frontEffective);
+                if (result != Result::OK) return result;
+                frontProgrammed = frontEffective;
+            }
+            if (!batchParamsEqual(backEffective, backProgrammed)) {
+                Result result = programBatch(oldState.backHandle, backEffective);
+                if (result != Result::OK) {
+                    if (oldState.frontProgrammedBatch.valid &&
+                        !batchParamsEqual(frontProgrammed, oldState.frontProgrammedBatch) &&
+                        programBatch(oldState.frontHandle, oldState.frontProgrammedBatch) ==
+                                Result::OK) {
+                        frontProgrammed = oldState.frontProgrammedBatch;
+                    }
+                    std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+                    gFusedAls.frontProgrammedBatch = frontProgrammed;
+                    return result;
+                }
+                backProgrammed = backEffective;
+            }
+
+            std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+            gFusedAls.fusedBatch = requested;
+            gFusedAls.frontProgrammedBatch = frontProgrammed;
+            gFusedAls.backProgrammedBatch = backProgrammed;
+            return Result::OK;
+        }
+
+        const bool externallyActive = sourceIsFront ? oldState.frontExternallyActive
+                                                    : oldState.backExternallyActive;
+        if (!externallyActive && oldState.active) {
+            std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+            if (sourceIsFront) {
+                gFusedAls.frontExternalBatch = requested;
+            } else {
+                gFusedAls.backExternalBatch = requested;
+            }
+            return Result::OK;
+        }
+
+        const int32_t sourceHandle = sourceIsFront ? oldState.frontHandle : oldState.backHandle;
+        const BatchParams oldProgrammed = sourceIsFront ? oldState.frontProgrammedBatch
+                                                        : oldState.backProgrammedBatch;
+        const BatchParams effective = combineBatchParams(
+                requested, oldState.active ? oldState.fusedBatch : BatchParams{});
+        Result result = batchParamsEqual(effective, oldProgrammed)
+                ? Result::OK
+                : programBatch(sourceHandle, effective);
+        if (result != Result::OK) return result;
+
+        std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+        if (sourceIsFront) {
+            gFusedAls.frontExternalBatch = requested;
+            gFusedAls.frontProgrammedBatch = effective;
+        } else {
+            gFusedAls.backExternalBatch = requested;
+            gFusedAls.backProgrammedBatch = effective;
+        }
+        return Result::OK;
     }
 #endif
 
@@ -912,14 +1008,95 @@ Return<Result> HalProxy::batch(int32_t sensorHandle, int64_t samplingPeriodNs,
 
 Return<Result> HalProxy::flush(int32_t sensorHandle) {
 #if defined(XIAOMI_DUAL_ALS_FUSION)
+    bool isFusedAls = false;
+    bool isFusedAlsSource = false;
+    bool sourceIsFront = false;
     {
         std::lock_guard<std::mutex> lock(gFusedAlsMutex);
-        if (gFusedAls.configured && sensorHandle == gFusedAls.fusedHandle) {
-            // The fused sensor has no independent hardware FIFO. The framework does not flush
-            // the auto-brightness sensor, so report the operation as unsupported rather than
-            // emitting a flush-complete event with incorrect ordering.
-            return Result::INVALID_OPERATION;
+        isFusedAls = gFusedAls.configured && sensorHandle == gFusedAls.fusedHandle;
+        if (gFusedAls.configured && sensorHandle == gFusedAls.frontHandle) {
+            isFusedAlsSource = true;
+            sourceIsFront = true;
+        } else if (gFusedAls.configured && sensorHandle == gFusedAls.backHandle) {
+            isFusedAlsSource = true;
         }
+    }
+    if (isFusedAls) {
+        std::lock_guard<std::recursive_mutex> controlLock(gFusedAlsControlMutex);
+        int32_t frontHandle;
+        int32_t backHandle;
+        uint64_t flushId;
+        {
+            std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+            if (!gFusedAls.active) return Result::BAD_VALUE;
+            frontHandle = gFusedAls.frontHandle;
+            backHandle = gFusedAls.backHandle;
+            flushId = gFusedAls.nextFlushId++;
+            gFusedAls.fusedFlushRequests.push_back({flushId, false, false});
+            gFusedAls.frontFlushRequests.push_back({flushId, true});
+            gFusedAls.backFlushRequests.push_back({flushId, true});
+        }
+
+        auto cancelFlush = [flushId](bool frontFlushAccepted) {
+            std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+            auto removeById = [flushId](auto* requests) {
+                requests->erase(
+                        std::remove_if(requests->begin(), requests->end(),
+                                       [flushId](const auto& request) {
+                                           return request.id == flushId;
+                                       }),
+                        requests->end());
+            };
+            // A successful source flush cannot be cancelled. Keep its entry as a tombstone so
+            // the eventual callback cannot be mistaken for a later request.
+            if (!frontFlushAccepted) removeById(&gFusedAls.frontFlushRequests);
+            removeById(&gFusedAls.backFlushRequests);
+            removeById(&gFusedAls.fusedFlushRequests);
+        };
+
+        Result result = getSubHalForSensorHandle(frontHandle)->flush(
+                clearSubHalIndex(frontHandle));
+        if (result != Result::OK) {
+            cancelFlush(false);
+            return result;
+        }
+        result = getSubHalForSensorHandle(backHandle)->flush(clearSubHalIndex(backHandle));
+        if (result != Result::OK) {
+            cancelFlush(true);
+            return result;
+        }
+        return Result::OK;
+    }
+    if (isFusedAlsSource) {
+        std::lock_guard<std::recursive_mutex> controlLock(gFusedAlsControlMutex);
+        uint64_t flushId;
+        {
+            std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+            const bool externallyActive = sourceIsFront ? gFusedAls.frontExternallyActive
+                                                        : gFusedAls.backExternallyActive;
+            if (!externallyActive) return Result::BAD_VALUE;
+            flushId = gFusedAls.nextFlushId++;
+            std::deque<FlushRequest>& requests = sourceIsFront
+                    ? gFusedAls.frontFlushRequests
+                    : gFusedAls.backFlushRequests;
+            requests.push_back({flushId, false});
+        }
+
+        Result result = getSubHalForSensorHandle(sensorHandle)->flush(
+                clearSubHalIndex(sensorHandle));
+        if (result != Result::OK) {
+            std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+            std::deque<FlushRequest>& requests = sourceIsFront
+                    ? gFusedAls.frontFlushRequests
+                    : gFusedAls.backFlushRequests;
+            requests.erase(
+                    std::remove_if(requests.begin(), requests.end(),
+                                   [flushId](const FlushRequest& request) {
+                                       return request.id == flushId;
+                                   }),
+                    requests.end());
+        }
+        return result;
     }
 #endif
 
