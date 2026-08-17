@@ -1495,6 +1495,9 @@ void HalProxy::handlePendingWrites() {
             size_t numWakeupEvents = mPendingWriteEventsQueue.front().second;
             size_t eventQueueSize = mEventQueue->getQuantumCount();
             size_t numToWrite = std::min(pendingWriteEvents.size(), eventQueueSize);
+            size_t numWakeupEventsToWrite = numWakeupEvents > 0
+                    ? countNumWakeupEvents(pendingWriteEvents, numToWrite)
+                    : 0;
             lock.unlock();
             if (!mEventQueue->writeBlocking(
                         pendingWriteEvents.data(), numToWrite,
@@ -1503,17 +1506,14 @@ void HalProxy::handlePendingWrites() {
                         kPendingWriteTimeoutNs, mEventQueueFlag)) {
                 ALOGE("Dropping %zu events after blockingWrite failed (is system_server running?).",
                       numToWrite);
-                if (numWakeupEvents > 0) {
-                    if (pendingWriteEvents.size() > eventQueueSize) {
-                        decrementRefCountAndMaybeReleaseWakelock(
-                                countNumWakeupEvents(pendingWriteEvents, eventQueueSize));
-                    } else {
-                        decrementRefCountAndMaybeReleaseWakelock(numWakeupEvents);
-                    }
+                if (numWakeupEventsToWrite > 0) {
+                    decrementRefCountAndMaybeReleaseWakelock(numWakeupEventsToWrite);
                 }
             }
             lock.lock();
             mSizePendingWriteEventsQueue -= numToWrite;
+            mPendingWriteEventsQueue.front().second -=
+                    std::min(mPendingWriteEventsQueue.front().second, numWakeupEventsToWrite);
             if (pendingWriteEvents.size() > eventQueueSize) {
                 // TODO(b/143302327): Check if this erase operation is too inefficient. It will copy
                 // all the events ahead of it down to fill gap off array at front after the erase.
