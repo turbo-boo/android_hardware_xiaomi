@@ -1387,7 +1387,7 @@ void HalProxy::init() {
         if (sensor.flags & V1_0::SensorFlagBits::WAKE_UP) {
             continue;
         }
-        if (frontAlsHandle == -1 && sensor.typeAsString == SENSOR_STRING_TYPE_LIGHT) {
+        if (frontAlsHandle == -1 && sensor.type == V2_1::SensorType::LIGHT) {
             frontAlsHandle = sensorEntry.first;
             frontAlsInfo = sensor;
         } else if (backAlsHandle == -1 && sensor.typeAsString == kBackAlsType) {
@@ -1407,11 +1407,18 @@ void HalProxy::init() {
         fusedAlsInfo.typeAsString = kFusedAlsType;
         fusedAlsInfo.maxRange = std::max(frontAlsInfo.maxRange, backAlsInfo.maxRange);
         fusedAlsInfo.power = frontAlsInfo.power + backAlsInfo.power;
+        fusedAlsInfo.minDelay = 0;
+        fusedAlsInfo.maxDelay = 0;
         fusedAlsInfo.fifoReservedEventCount = 0;
         fusedAlsInfo.fifoMaxEventCount = 0;
         fusedAlsInfo.requiredPermission = "";
         fusedAlsInfo.flags &= ~(static_cast<uint32_t>(V1_0::SensorFlagBits::MASK_DIRECT_REPORT) |
-                                static_cast<uint32_t>(V1_0::SensorFlagBits::MASK_DIRECT_CHANNEL));
+                                static_cast<uint32_t>(V1_0::SensorFlagBits::MASK_DIRECT_CHANNEL) |
+                                static_cast<uint32_t>(V1_0::SensorFlagBits::DATA_INJECTION) |
+                                static_cast<uint32_t>(V1_0::SensorFlagBits::ADDITIONAL_INFO) |
+                                static_cast<uint32_t>(V1_0::SensorFlagBits::DYNAMIC_SENSOR) |
+                                static_cast<uint32_t>(V1_0::SensorFlagBits::MASK_REPORTING_MODE));
+        fusedAlsInfo.flags |= static_cast<uint32_t>(V1_0::SensorFlagBits::ON_CHANGE_MODE);
         mSensors.emplace(kFusedAlsHandle, fusedAlsInfo);
 
         {
@@ -1420,6 +1427,8 @@ void HalProxy::init() {
             gFusedAls.fusedSensorType = kFusedAlsSensorType;
             gFusedAls.frontHandle = frontAlsHandle;
             gFusedAls.backHandle = backAlsHandle;
+            gFusedAls.frontSensorType = frontAlsInfo.type;
+            gFusedAls.backSensorType = backAlsInfo.type;
             gFusedAls.configured = true;
         }
 
