@@ -26,8 +26,10 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <deque>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <thread>
 
@@ -55,25 +57,164 @@ constexpr int32_t kFusedAlsHandle = 0x7f000001;
 constexpr int32_t kFusedAlsSensorType =
         static_cast<int32_t>(V2_1::SensorType::DEVICE_PRIVATE_BASE) + 0xdada;
 
+struct BatchParams {
+    bool valid = false;
+    int64_t samplingPeriodNs = 0;
+    int64_t maxReportLatencyNs = 0;
+};
+
+struct FlushRequest {
+    uint64_t id = 0;
+    bool fused = false;
+};
+
+struct FusedFlushRequest {
+    uint64_t id = 0;
+    bool frontComplete = false;
+    bool backComplete = false;
+};
+
 struct FusedAlsState {
     int32_t fusedHandle = -1;
     int32_t fusedSensorType = -1;
     int32_t frontHandle = -1;
     int32_t backHandle = -1;
+    V2_1::SensorType frontSensorType = V2_1::SensorType::LIGHT;
+    V2_1::SensorType backSensorType = V2_1::SensorType::DEVICE_PRIVATE_BASE;
     bool configured = false;
     bool active = false;
+    bool enabling = false;
+    bool frontExternalEnabling = false;
+    bool backExternalEnabling = false;
     bool frontExternallyActive = false;
     bool backExternallyActive = false;
+    bool frontHardwareActive = false;
+    bool backHardwareActive = false;
     bool frontValueValid = false;
     bool backValueValid = false;
     float frontLux = 0.0f;
     float backLux = 0.0f;
+    int64_t frontTimestamp = 0;
+    int64_t backTimestamp = 0;
     bool lastOutputValid = false;
     float lastOutputLux = 0.0f;
+    int64_t lastOutputTimestamp = 0;
+    BatchParams fusedBatch;
+    BatchParams frontExternalBatch;
+    BatchParams backExternalBatch;
+    BatchParams frontProgrammedBatch;
+    BatchParams backProgrammedBatch;
+    std::vector<V2_1::Event> frontPendingActivationEvents;
+    std::vector<V2_1::Event> backPendingActivationEvents;
+    uint64_t nextFlushId = 1;
+    std::deque<FlushRequest> frontFlushRequests;
+    std::deque<FlushRequest> backFlushRequests;
+    std::deque<FusedFlushRequest> fusedFlushRequests;
 };
 
 FusedAlsState gFusedAls;
 std::mutex gFusedAlsMutex;
+std::recursive_mutex gFusedAlsControlMutex;
+
+bool batchParamsEqual(const BatchParams& left, const BatchParams& right) {
+    return left.valid == right.valid &&
+            (!left.valid || (left.samplingPeriodNs == right.samplingPeriodNs &&
+                             left.maxReportLatencyNs == right.maxReportLatencyNs));
+}
+
+BatchParams combineBatchParams(const BatchParams& first, const BatchParams& second) {
+    if (!first.valid) return second;
+    if (!second.valid) return first;
+    return {
+            true,
+            std::min(first.samplingPeriodNs, second.samplingPeriodNs),
+            std::min(first.maxReportLatencyNs, second.maxReportLatencyNs),
+    };
+}
+
+void restoreFusedEventStateLocked(const FusedAlsState& state) {
+    gFusedAls.frontValueValid = state.frontValueValid;
+    gFusedAls.backValueValid = state.backValueValid;
+    gFusedAls.frontLux = state.frontLux;
+    gFusedAls.backLux = state.backLux;
+    gFusedAls.frontTimestamp = state.frontTimestamp;
+    gFusedAls.backTimestamp = state.backTimestamp;
+    gFusedAls.lastOutputValid = state.lastOutputValid;
+    gFusedAls.lastOutputLux = state.lastOutputLux;
+    gFusedAls.lastOutputTimestamp = state.lastOutputTimestamp;
+}
+
+V2_1::Event makeFusedAlsEventLocked(float lux, int64_t timestamp) {
+    if (gFusedAls.lastOutputValid && timestamp <= gFusedAls.lastOutputTimestamp) {
+        if (gFusedAls.lastOutputTimestamp == std::numeric_limits<int64_t>::max()) {
+            return {};
+        }
+        timestamp = gFusedAls.lastOutputTimestamp + 1;
+    }
+
+    V2_1::Event event{};
+    event.timestamp = timestamp;
+    event.sensorHandle = gFusedAls.fusedHandle;
+    event.sensorType = static_cast<V2_1::SensorType>(gFusedAls.fusedSensorType);
+    event.u.data[0] = lux;
+    gFusedAls.lastOutputLux = lux;
+    gFusedAls.lastOutputTimestamp = timestamp;
+    gFusedAls.lastOutputValid = true;
+    return event;
+}
+
+template <typename EventQueue>
+bool enqueueEventsLocked(const std::vector<V2_1::Event>& events, EventQueue* eventQueue,
+                         EventFlag* eventQueueFlag,
+                         const std::map<int32_t, V2_1::SensorInfo>& sensors,
+                         std::queue<std::pair<std::vector<V2_1::Event>, size_t>>* pendingEvents,
+                         size_t* pendingSize, size_t* mostPending, size_t maxPending,
+                         std::condition_variable* eventQueueWriteCV,
+                         size_t* droppedWakeupEvents = nullptr) {
+    if (droppedWakeupEvents != nullptr) *droppedWakeupEvents = 0;
+    if (events.empty()) return true;
+    if (eventQueue == nullptr || eventQueueFlag == nullptr) return false;
+
+    auto countWakeupEvents = [&sensors, &events](size_t begin) {
+        size_t count = 0;
+        for (size_t i = begin; i < events.size(); ++i) {
+            auto sensor = sensors.find(events[i].sensorHandle);
+            if (sensor != sensors.end() &&
+                (sensor->second.flags & static_cast<uint32_t>(V1_0::SensorFlagBits::WAKE_UP))) {
+                ++count;
+            }
+        }
+        return count;
+    };
+
+    size_t numToWrite = 0;
+    if (pendingEvents->empty()) {
+        numToWrite = std::min(events.size(), eventQueue->availableToWrite());
+        if (numToWrite > 0) {
+            if (eventQueue->write(events.data(), numToWrite)) {
+                eventQueueFlag->wake(
+                        static_cast<uint32_t>(EventQueueFlagBits::READ_AND_PROCESS));
+            } else {
+                numToWrite = 0;
+            }
+        }
+    }
+
+    const size_t numLeft = events.size() - numToWrite;
+    if (numLeft == 0) return true;
+    const size_t pendingWakeupEvents = countWakeupEvents(numToWrite);
+    if (*pendingSize + numLeft > maxPending) {
+        if (droppedWakeupEvents != nullptr) *droppedWakeupEvents = pendingWakeupEvents;
+        return false;
+    }
+
+    std::vector<V2_1::Event> eventsLeft(events.begin() + numToWrite, events.end());
+    pendingEvents->push({std::move(eventsLeft), pendingWakeupEvents});
+    *pendingSize += numLeft;
+    *mostPending = std::max(*mostPending, *pendingSize);
+    eventQueueWriteCV->notify_one();
+    return true;
+}
 
 }  // namespace
 #endif
@@ -221,88 +362,371 @@ Return<Result> HalProxy::setOperationMode(OperationMode mode) {
 
 Return<Result> HalProxy::activate(int32_t sensorHandle, bool enabled) {
 #if defined(XIAOMI_DUAL_ALS_FUSION)
-    int32_t frontAlsHandle = -1;
-    int32_t backAlsHandle = -1;
     bool isFusedAls = false;
     bool isFusedAlsSource = false;
-    bool suppressDisable = false;
     bool sourceIsFront = false;
     {
         std::lock_guard<std::mutex> lock(gFusedAlsMutex);
         if (gFusedAls.configured && sensorHandle == gFusedAls.fusedHandle) {
             isFusedAls = true;
-            frontAlsHandle = gFusedAls.frontHandle;
-            backAlsHandle = gFusedAls.backHandle;
         } else if (gFusedAls.configured && sensorHandle == gFusedAls.frontHandle) {
             isFusedAlsSource = true;
             sourceIsFront = true;
-            suppressDisable = !enabled && gFusedAls.active;
         } else if (gFusedAls.configured && sensorHandle == gFusedAls.backHandle) {
             isFusedAlsSource = true;
-            suppressDisable = !enabled && gFusedAls.active;
         }
     }
 
-    if (isFusedAls) {
-        bool alreadyActive;
-        bool frontExternallyActive;
-        bool backExternallyActive;
+    if (isFusedAls || isFusedAlsSource) {
+        std::lock_guard<std::recursive_mutex> controlLock(gFusedAlsControlMutex);
+        FusedAlsState oldState;
         {
             std::lock_guard<std::mutex> lock(gFusedAlsMutex);
-            alreadyActive = gFusedAls.active;
-            frontExternallyActive = gFusedAls.frontExternallyActive;
-            backExternallyActive = gFusedAls.backExternallyActive;
-            if (!enabled) {
-                gFusedAls.active = false;
-                gFusedAls.frontValueValid = false;
-                gFusedAls.backValueValid = false;
-                gFusedAls.lastOutputValid = false;
-            }
+            oldState = gFusedAls;
         }
 
-        if (alreadyActive == enabled) {
-            return Result::OK;
-        }
-
-        auto activateSource = [this](int32_t sourceHandle, bool sourceEnabled) {
+        auto activateSource = [this](int32_t sourceHandle, bool sourceEnabled) -> Result {
             return getSubHalForSensorHandle(sourceHandle)->activate(
                     clearSubHalIndex(sourceHandle), sourceEnabled);
         };
+        auto programBatch = [this](int32_t sourceHandle, const BatchParams& params) -> Result {
+            if (!params.valid) return Result::OK;
+            return getSubHalForSensorHandle(sourceHandle)->batch(
+                    clearSubHalIndex(sourceHandle), params.samplingPeriodNs,
+                    params.maxReportLatencyNs);
+        };
 
-        if (enabled) {
-            Result result = activateSource(frontAlsHandle, true);
-            if (result != Result::OK) {
-                return result;
+        if (isFusedAls) {
+            const BatchParams frontEffective = combineBatchParams(
+                    oldState.fusedBatch,
+                    oldState.frontExternallyActive ? oldState.frontExternalBatch : BatchParams{});
+            const BatchParams backEffective = combineBatchParams(
+                    oldState.fusedBatch,
+                    oldState.backExternallyActive ? oldState.backExternalBatch : BatchParams{});
+
+            if (enabled) {
+                if (oldState.active && oldState.frontHardwareActive &&
+                    oldState.backHardwareActive) {
+                    return Result::OK;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+                    gFusedAls.enabling = true;
+                    if (!oldState.active) {
+                        gFusedAls.lastOutputValid = false;
+                    }
+                }
+
+                BatchParams frontProgrammed = oldState.frontProgrammedBatch;
+                BatchParams backProgrammed = oldState.backProgrammedBatch;
+                if (!batchParamsEqual(frontEffective, frontProgrammed)) {
+                    Result result = programBatch(oldState.frontHandle, frontEffective);
+                    if (result != Result::OK) {
+                        std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+                        gFusedAls.enabling = false;
+                        return result;
+                    }
+                    frontProgrammed = frontEffective;
+                }
+                if (!batchParamsEqual(backEffective, backProgrammed)) {
+                    Result result = programBatch(oldState.backHandle, backEffective);
+                    if (result != Result::OK) {
+                        if (oldState.frontProgrammedBatch.valid &&
+                            !batchParamsEqual(frontProgrammed, oldState.frontProgrammedBatch)) {
+                            if (programBatch(oldState.frontHandle, oldState.frontProgrammedBatch) ==
+                                Result::OK) {
+                                frontProgrammed = oldState.frontProgrammedBatch;
+                            }
+                        }
+                        std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+                        gFusedAls.enabling = false;
+                        gFusedAls.frontProgrammedBatch = frontProgrammed;
+                        return result;
+                    }
+                    backProgrammed = backEffective;
+                }
+
+                bool frontHardwareActive = oldState.frontHardwareActive;
+                bool backHardwareActive = oldState.backHardwareActive;
+                const bool enabledFrontThisCall = !frontHardwareActive;
+                if (enabledFrontThisCall) {
+                    Result result = activateSource(oldState.frontHandle, true);
+                    if (result != Result::OK) {
+                        if (oldState.frontProgrammedBatch.valid &&
+                            !batchParamsEqual(frontProgrammed, oldState.frontProgrammedBatch) &&
+                            programBatch(oldState.frontHandle, oldState.frontProgrammedBatch) ==
+                                    Result::OK) {
+                            frontProgrammed = oldState.frontProgrammedBatch;
+                        }
+                        if (oldState.backProgrammedBatch.valid &&
+                            !batchParamsEqual(backProgrammed, oldState.backProgrammedBatch) &&
+                            programBatch(oldState.backHandle, oldState.backProgrammedBatch) ==
+                                    Result::OK) {
+                            backProgrammed = oldState.backProgrammedBatch;
+                        }
+                        std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+                        gFusedAls.enabling = false;
+                        gFusedAls.frontProgrammedBatch = frontProgrammed;
+                        gFusedAls.backProgrammedBatch = backProgrammed;
+                        restoreFusedEventStateLocked(oldState);
+                        return result;
+                    }
+                    frontHardwareActive = true;
+                }
+
+                if (!backHardwareActive) {
+                    Result result = activateSource(oldState.backHandle, true);
+                    if (result != Result::OK) {
+                        if (enabledFrontThisCall &&
+                            activateSource(oldState.frontHandle, false) == Result::OK) {
+                            frontHardwareActive = false;
+                        }
+                        if (oldState.frontProgrammedBatch.valid &&
+                            !batchParamsEqual(frontProgrammed, oldState.frontProgrammedBatch) &&
+                            programBatch(oldState.frontHandle, oldState.frontProgrammedBatch) ==
+                                    Result::OK) {
+                            frontProgrammed = oldState.frontProgrammedBatch;
+                        }
+                        if (oldState.backProgrammedBatch.valid &&
+                            !batchParamsEqual(backProgrammed, oldState.backProgrammedBatch) &&
+                            programBatch(oldState.backHandle, oldState.backProgrammedBatch) ==
+                                    Result::OK) {
+                            backProgrammed = oldState.backProgrammedBatch;
+                        }
+                        std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+                        gFusedAls.enabling = false;
+                        gFusedAls.frontHardwareActive = frontHardwareActive;
+                        gFusedAls.frontProgrammedBatch = frontProgrammed;
+                        gFusedAls.backProgrammedBatch = backProgrammed;
+                        restoreFusedEventStateLocked(oldState);
+                        return result;
+                    }
+                    backHardwareActive = true;
+                }
+
+                std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+                gFusedAls.frontHardwareActive = frontHardwareActive;
+                gFusedAls.backHardwareActive = backHardwareActive;
+                gFusedAls.frontProgrammedBatch = frontProgrammed;
+                gFusedAls.backProgrammedBatch = backProgrammed;
+                gFusedAls.active = true;
+                gFusedAls.enabling = false;
+
+                if ((gFusedAls.frontValueValid || gFusedAls.backValueValid) &&
+                    !gFusedAls.lastOutputValid) {
+                    const float fusedLux = gFusedAls.frontValueValid && gFusedAls.backValueValid
+                            ? std::max(gFusedAls.frontLux, gFusedAls.backLux)
+                            : gFusedAls.frontValueValid ? gFusedAls.frontLux : gFusedAls.backLux;
+                    const int64_t timestamp = gFusedAls.frontValueValid &&
+                                    gFusedAls.backValueValid
+                            ? std::max(gFusedAls.frontTimestamp, gFusedAls.backTimestamp)
+                            : gFusedAls.frontValueValid ? gFusedAls.frontTimestamp
+                                                       : gFusedAls.backTimestamp;
+                    const Event fusedEvent = makeFusedAlsEventLocked(fusedLux, timestamp);
+                    std::lock_guard<std::mutex> queueLock(mEventQueueWriteMutex);
+                    if (!enqueueEventsLocked(
+                                {fusedEvent}, mEventQueue.get(), mEventQueueFlag, mSensors,
+                                &mPendingWriteEventsQueue, &mSizePendingWriteEventsQueue,
+                                &mMostEventsObservedPendingWriteEventsQueue,
+                                kMaxSizePendingWriteEventsQueue, &mEventQueueWriteCV)) {
+                        gFusedAls.lastOutputValid = false;
+                        ALOGE("Failed to queue initial fused ALS event");
+                    }
+                }
+                return Result::OK;
             }
-            result = activateSource(backAlsHandle, true);
-            if (result != Result::OK) {
-                activateSource(frontAlsHandle, false);
-                return result;
+
+            if (!oldState.active &&
+                oldState.frontHardwareActive == oldState.frontExternallyActive &&
+                oldState.backHardwareActive == oldState.backExternallyActive) {
+                return Result::OK;
             }
+
+            bool frontHardwareActive = oldState.frontHardwareActive;
+            bool backHardwareActive = oldState.backHardwareActive;
+            bool disabledFrontThisCall = false;
+            if (frontHardwareActive && !oldState.frontExternallyActive) {
+                Result result = activateSource(oldState.frontHandle, false);
+                if (result != Result::OK) return result;
+                frontHardwareActive = false;
+                disabledFrontThisCall = true;
+            }
+            if (backHardwareActive && !oldState.backExternallyActive) {
+                Result result = activateSource(oldState.backHandle, false);
+                if (result != Result::OK) {
+                    if (disabledFrontThisCall &&
+                        activateSource(oldState.frontHandle, true) == Result::OK) {
+                        frontHardwareActive = true;
+                    }
+                    std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+                    gFusedAls.frontHardwareActive = frontHardwareActive;
+                    return result;
+                }
+                backHardwareActive = false;
+            }
+
+            BatchParams frontProgrammed = oldState.frontProgrammedBatch;
+            BatchParams backProgrammed = oldState.backProgrammedBatch;
+            if (oldState.frontExternallyActive && oldState.frontExternalBatch.valid &&
+                !batchParamsEqual(frontProgrammed, oldState.frontExternalBatch) &&
+                programBatch(oldState.frontHandle, oldState.frontExternalBatch) == Result::OK) {
+                frontProgrammed = oldState.frontExternalBatch;
+            }
+            if (oldState.backExternallyActive && oldState.backExternalBatch.valid &&
+                !batchParamsEqual(backProgrammed, oldState.backExternalBatch) &&
+                programBatch(oldState.backHandle, oldState.backExternalBatch) == Result::OK) {
+                backProgrammed = oldState.backExternalBatch;
+            }
+
             std::lock_guard<std::mutex> lock(gFusedAlsMutex);
-            gFusedAls.active = true;
+            gFusedAls.active = false;
+            gFusedAls.enabling = false;
+            gFusedAls.frontHardwareActive = frontHardwareActive;
+            gFusedAls.backHardwareActive = backHardwareActive;
+            gFusedAls.frontProgrammedBatch = frontProgrammed;
+            gFusedAls.backProgrammedBatch = backProgrammed;
+            if (!frontHardwareActive) gFusedAls.frontValueValid = false;
+            if (!backHardwareActive) gFusedAls.backValueValid = false;
+            gFusedAls.lastOutputValid = false;
             return Result::OK;
         }
 
-        Result result = Result::OK;
-        if (!frontExternallyActive) {
-            result = activateSource(frontAlsHandle, false);
-        }
-        if (!backExternallyActive) {
-            Result backResult = activateSource(backAlsHandle, false);
-            if (result == Result::OK) {
-                result = backResult;
-            }
-        }
-        return result;
-    }
+        const bool externallyActive = sourceIsFront ? oldState.frontExternallyActive
+                                                    : oldState.backExternallyActive;
+        const bool hardwareActive = sourceIsFront ? oldState.frontHardwareActive
+                                                  : oldState.backHardwareActive;
+        const int32_t sourceHandle = sourceIsFront ? oldState.frontHandle : oldState.backHandle;
+        const BatchParams externalBatch = sourceIsFront ? oldState.frontExternalBatch
+                                                        : oldState.backExternalBatch;
+        const BatchParams oldProgrammed = sourceIsFront ? oldState.frontProgrammedBatch
+                                                        : oldState.backProgrammedBatch;
 
-    if (isFusedAlsSource && suppressDisable) {
+        if (enabled) {
+            if (externallyActive && hardwareActive) return Result::OK;
+            const BatchParams effective = combineBatchParams(
+                    externalBatch, oldState.active ? oldState.fusedBatch : BatchParams{});
+            BatchParams programmed = oldProgrammed;
+            if (!batchParamsEqual(effective, programmed)) {
+                Result result = programBatch(sourceHandle, effective);
+                if (result != Result::OK) return result;
+                programmed = effective;
+            }
+
+            if (!hardwareActive) {
+                {
+                    std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+                    if (sourceIsFront) {
+                        gFusedAls.frontExternalEnabling = true;
+                        gFusedAls.frontPendingActivationEvents.clear();
+                        gFusedAls.frontProgrammedBatch = programmed;
+                    } else {
+                        gFusedAls.backExternalEnabling = true;
+                        gFusedAls.backPendingActivationEvents.clear();
+                        gFusedAls.backProgrammedBatch = programmed;
+                    }
+                }
+                Result result = activateSource(sourceHandle, true);
+                if (result != Result::OK) {
+                    if (oldProgrammed.valid && !batchParamsEqual(programmed, oldProgrammed) &&
+                        programBatch(sourceHandle, oldProgrammed) == Result::OK) {
+                        programmed = oldProgrammed;
+                    }
+                    std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+                    if (sourceIsFront) {
+                        gFusedAls.frontExternalEnabling = false;
+                        gFusedAls.frontExternallyActive = externallyActive;
+                        gFusedAls.frontProgrammedBatch = programmed;
+                        gFusedAls.frontValueValid = oldState.frontValueValid;
+                        gFusedAls.frontLux = oldState.frontLux;
+                        gFusedAls.frontTimestamp = oldState.frontTimestamp;
+                        gFusedAls.frontPendingActivationEvents.clear();
+                    } else {
+                        gFusedAls.backExternalEnabling = false;
+                        gFusedAls.backExternallyActive = externallyActive;
+                        gFusedAls.backProgrammedBatch = programmed;
+                        gFusedAls.backValueValid = oldState.backValueValid;
+                        gFusedAls.backLux = oldState.backLux;
+                        gFusedAls.backTimestamp = oldState.backTimestamp;
+                        gFusedAls.backPendingActivationEvents.clear();
+                    }
+                    return result;
+                }
+            }
+
+            std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+            std::vector<Event> pendingEvents;
+            if (sourceIsFront) {
+                gFusedAls.frontExternalEnabling = false;
+                gFusedAls.frontExternallyActive = true;
+                gFusedAls.frontHardwareActive = true;
+                pendingEvents = std::move(gFusedAls.frontPendingActivationEvents);
+            } else {
+                gFusedAls.backExternalEnabling = false;
+                gFusedAls.backExternallyActive = true;
+                gFusedAls.backHardwareActive = true;
+                pendingEvents = std::move(gFusedAls.backPendingActivationEvents);
+            }
+            if (hardwareActive && pendingEvents.empty()) {
+                const bool valueValid = sourceIsFront ? gFusedAls.frontValueValid
+                                                      : gFusedAls.backValueValid;
+                if (valueValid) {
+                    Event currentValue{};
+                    currentValue.timestamp = getTimeNow();
+                    currentValue.sensorHandle = sourceHandle;
+                    currentValue.sensorType = sourceIsFront ? gFusedAls.frontSensorType
+                                                            : gFusedAls.backSensorType;
+                    if (sourceIsFront) {
+                        currentValue.u.scalar = gFusedAls.frontLux;
+                    } else {
+                        currentValue.u.data[0] = gFusedAls.backLux;
+                    }
+                    pendingEvents.push_back(currentValue);
+                }
+            }
+            if (!pendingEvents.empty()) {
+                std::lock_guard<std::mutex> queueLock(mEventQueueWriteMutex);
+                if (!enqueueEventsLocked(
+                            pendingEvents, mEventQueue.get(), mEventQueueFlag, mSensors,
+                            &mPendingWriteEventsQueue, &mSizePendingWriteEventsQueue,
+                            &mMostEventsObservedPendingWriteEventsQueue,
+                            kMaxSizePendingWriteEventsQueue, &mEventQueueWriteCV)) {
+                    ALOGE("Failed to queue initial physical ALS events");
+                }
+            }
+            return Result::OK;
+        }
+
+        if (!externallyActive) return Result::OK;
+        if (oldState.active) {
+            const BatchParams effective = oldState.fusedBatch;
+            BatchParams programmed = oldProgrammed;
+            if (effective.valid && !batchParamsEqual(effective, programmed) &&
+                programBatch(sourceHandle, effective) == Result::OK) {
+                programmed = effective;
+            }
+            std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+            if (sourceIsFront) {
+                gFusedAls.frontExternallyActive = false;
+                gFusedAls.frontProgrammedBatch = programmed;
+            } else {
+                gFusedAls.backExternallyActive = false;
+                gFusedAls.backProgrammedBatch = programmed;
+            }
+            return Result::OK;
+        }
+
+        Result result = hardwareActive ? activateSource(sourceHandle, false) : Result::OK;
+        if (result != Result::OK) return result;
         std::lock_guard<std::mutex> lock(gFusedAlsMutex);
         if (sourceIsFront) {
             gFusedAls.frontExternallyActive = false;
+            gFusedAls.frontHardwareActive = false;
+            gFusedAls.frontValueValid = false;
         } else {
             gFusedAls.backExternallyActive = false;
+            gFusedAls.backHardwareActive = false;
+            gFusedAls.backValueValid = false;
         }
         return Result::OK;
     }
@@ -313,17 +737,6 @@ Return<Result> HalProxy::activate(int32_t sensorHandle, bool enabled) {
     }
     Result result = getSubHalForSensorHandle(sensorHandle)
             ->activate(clearSubHalIndex(sensorHandle), enabled);
-
-#if defined(XIAOMI_DUAL_ALS_FUSION)
-    if (isFusedAlsSource && result == Result::OK) {
-        std::lock_guard<std::mutex> lock(gFusedAlsMutex);
-        if (sourceIsFront) {
-            gFusedAls.frontExternallyActive = enabled;
-        } else {
-            gFusedAls.backExternallyActive = enabled;
-        }
-    }
-#endif
 
     return result;
 }
@@ -377,6 +790,9 @@ Return<Result> HalProxy::initializeCommon(
         std::unique_ptr<WakeLockMessageQueueWrapperBase>& wakeLockQueue,
         const sp<ISensorsCallbackWrapperBase>& sensorsCallback) {
     Result result = Result::OK;
+#if defined(XIAOMI_DUAL_ALS_FUSION)
+    std::lock_guard<std::recursive_mutex> controlLock(gFusedAlsControlMutex);
+#endif
 
     stopThreads();
     resetSharedWakelock();
@@ -384,6 +800,34 @@ Return<Result> HalProxy::initializeCommon(
     // So that the pending write events queue can be cleared safely and when we start threads
     // again we do not get new events until after initialize resets the subhals.
     disableAllSensors();
+
+#if defined(XIAOMI_DUAL_ALS_FUSION)
+    {
+        std::lock_guard<std::mutex> lock(gFusedAlsMutex);
+        gFusedAls.active = false;
+        gFusedAls.enabling = false;
+        gFusedAls.frontExternalEnabling = false;
+        gFusedAls.backExternalEnabling = false;
+        gFusedAls.frontExternallyActive = false;
+        gFusedAls.backExternallyActive = false;
+        gFusedAls.frontHardwareActive = false;
+        gFusedAls.backHardwareActive = false;
+        gFusedAls.frontValueValid = false;
+        gFusedAls.backValueValid = false;
+        gFusedAls.lastOutputValid = false;
+        gFusedAls.fusedBatch = {};
+        gFusedAls.frontExternalBatch = {};
+        gFusedAls.backExternalBatch = {};
+        gFusedAls.frontProgrammedBatch = {};
+        gFusedAls.backProgrammedBatch = {};
+        gFusedAls.frontPendingActivationEvents.clear();
+        gFusedAls.backPendingActivationEvents.clear();
+        gFusedAls.nextFlushId = 1;
+        gFusedAls.frontFlushRequests.clear();
+        gFusedAls.backFlushRequests.clear();
+        gFusedAls.fusedFlushRequests.clear();
+    }
+#endif
 
     // Clears the queue if any events were pending write before.
     mPendingWriteEventsQueue = std::queue<std::pair<std::vector<V2_1::Event>, size_t>>();
