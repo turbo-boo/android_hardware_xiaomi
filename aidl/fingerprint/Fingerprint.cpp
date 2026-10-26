@@ -15,6 +15,7 @@
 #include <android-base/properties.h>
 #include <android-base/strings.h>
 
+using ::android::base::GetProperty;
 using ::android::base::SetProperty;
 
 namespace aidl::android::hardware::biometrics::fingerprint {
@@ -54,7 +55,20 @@ Fingerprint::Fingerprint(std::shared_ptr<FingerprintConfig> config)
     if (mDevice) {
         ALOGI("fingerprint HAL already opened");
     } else {
-        for (auto& [module] : kModules) {
+        // Opening a backend runs its sensor and TEE init even when its sensor is absent, so
+        // a Goodix unit would otherwise initialize the Qualcomm stack on every boot. Try the
+        // backend that opened last time before walking the list.
+        const std::string lastVendor = GetProperty("persist.vendor.sys.fp.vendor", "");
+        std::vector<std::string> modules;
+        for (const auto& [module] : kModules) {
+            if (lastVendor == ::android::base::Split(module, ":")[0]) {
+                modules.insert(modules.begin(), module);
+            } else {
+                modules.emplace_back(module);
+            }
+        }
+
+        for (const auto& module : modules) {
             std::string class_name;
             std::string class_module_id;
 
