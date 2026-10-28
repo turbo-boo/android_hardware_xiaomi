@@ -7,6 +7,8 @@
 #pragma once
 #define LOG_TAG "android.hardware.biometrics.fingerprint-service.xiaomi"
 
+#include <atomic>
+
 #include <aidl/android/hardware/biometrics/fingerprint/BnSession.h>
 #include <aidl/android/hardware/biometrics/fingerprint/ISessionCallback.h>
 #include <android/log.h>
@@ -80,6 +82,7 @@ class Session : public BnSession {
 
     bool checkSensorLockout();
     void clearLockout(bool clearAttemptCounter);
+    void invalidateLockoutReset();
     void startLockoutTimer(int64_t timeout);
     void lockoutTimerExpired();
 
@@ -99,6 +102,9 @@ class Session : public BnSession {
     AIBinder_DeathRecipient* mDeathRecipient;
 
     UdfpsHandler* mUdfpsHandler;
+
+    // Shared with fallback callback workers; never capture a Session pointer.
+    std::shared_ptr<std::atomic_bool> mLockoutResetCompletion;
 };
 
 }  // namespace aidl::android::hardware::biometrics::fingerprint

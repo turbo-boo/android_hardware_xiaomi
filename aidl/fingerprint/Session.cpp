@@ -61,6 +61,7 @@ ndk::ScopedAStatus Session::revokeChallenge(int64_t challenge) {
 
 ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
                                    std::shared_ptr<ICancellationSignal>* out) {
+    invalidateLockoutReset();
     hw_auth_token_t authToken;
     translate(hat, authToken);
     if (mUdfpsHandler) {
@@ -85,6 +86,7 @@ ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
 
 ndk::ScopedAStatus Session::authenticate(int64_t operationId,
                                          std::shared_ptr<ICancellationSignal>* out) {
+    invalidateLockoutReset();
     checkSensorLockout();
     if (mUdfpsHandler) {
         mUdfpsHandler->onAuthenticateStarted();
@@ -177,33 +179,38 @@ ndk::ScopedAStatus Session::invalidateAuthenticatorId() {
 
 ndk::ScopedAStatus Session::resetLockout(const HardwareAuthToken& hat) {
 #ifdef IMPL_V2
-    if (mLockoutTracker.getMode() == LockoutTracker::LockoutMode::kNone) {
-        ALOGI("resetLockout: already unlocked, completing without a vendor request");
-        mLockoutTracker.reset(true);
-        if (mIsLockoutTimerStarted) mIsLockoutTimerAborted = true;
-
-        // ISession methods run on binder threads, while ISessionCallback must be invoked from a
-        // non-binder thread. Qualcomm's backend does not emit a completion callback when it is
-        // already unlocked, so complete this no-op request ourselves.
-        auto cb = mCb;
-        std::thread([cb]() {
-            auto status = cb->onLockoutCleared();
-            if (!status.isOk()) {
-                ALOGE("Failed to report no-op lockout reset: %s", status.getDescription().c_str());
-            }
-        }).detach();
-        return ndk::ScopedAStatus::ok();
-    }
-
-    if (mIsLockoutTimerStarted) mIsLockoutTimerAborted = true;
+    const bool wasLocallyUnlocked =
+            mLockoutTracker.getMode() == LockoutTracker::LockoutMode::kNone;
+    auto completion = std::make_shared<std::atomic_bool>(false);
+    std::atomic_store(&mLockoutResetCompletion, completion);
 
     hw_auth_token_t authToken;
     translate(hat, authToken);
 
+    // The local tracker is not the vendor/TEE lock state. Always ask the
+    // backend to validate the HAT and reset its own counter, even in kNone.
     int resetResult = mDevice->reset_lockout(mDevice, &authToken);
     if (resetResult != 0) {
+        completion->store(true);
         ALOGE("Failed to reset lockout: %d", resetResult);
         return ndk::ScopedAStatus::fromServiceSpecificError(resetResult);
+    }
+    if (mIsLockoutTimerStarted) mIsLockoutTimerAborted = true;
+
+    // QCOM can return success without a callback for an already-unlocked
+    // backend. Complete that case only after the vendor call succeeds; use
+    // the same token as notify() so synchronous or late callbacks cannot
+    // report the same request twice. The worker owns no Session pointer.
+    if (wasLocallyUnlocked && !completion->load()) {
+        mLockoutTracker.reset(true);
+        auto cb = mCb;
+        std::thread([cb, completion] {
+            if (completion->exchange(true)) return;
+            auto status = cb->onLockoutCleared();
+            if (!status.isOk()) {
+                ALOGE("Failed to report lockout reset: %s", status.getDescription().c_str());
+            }
+        }).detach();
     }
 #else
     clearLockout(true);
@@ -293,6 +300,7 @@ ndk::ScopedAStatus Session::cancel() {
 }
 
 ndk::ScopedAStatus Session::close() {
+    invalidateLockoutReset();
     mClosed = true;
     mCb->onSessionClosed();
     AIBinder_DeathRecipient_delete(mDeathRecipient);
@@ -392,6 +400,12 @@ void Session::clearLockout(bool clearAttemptCounter) {
     mCb->onLockoutCleared();
 }
 
+void Session::invalidateLockoutReset() {
+    auto completion = std::atomic_exchange(&mLockoutResetCompletion,
+                                          std::shared_ptr<std::atomic_bool>{});
+    if (completion) completion->store(true);
+}
+
 void Session::startLockoutTimer(int64_t timeout) {
     std::function<void()> action = std::bind(&Session::lockoutTimerExpired, this);
     std::thread([timeout, action]() {
@@ -413,6 +427,8 @@ void Session::notify(const fingerprint_msg_t* msg) {
     // const uint64_t devId = reinterpret_cast<uint64_t>(mDevice);
     switch (msg->type) {
         case FINGERPRINT_ERROR: {
+            auto completion = std::atomic_load(&mLockoutResetCompletion);
+            if (completion) completion->store(true);
             int32_t vendorCode = 0;
             Error result = VendorErrorFilter(msg->data.error, &vendorCode);
             ALOGD("onError(%hhd, %d)", result, vendorCode);
@@ -539,7 +555,11 @@ void Session::notify(const fingerprint_msg_t* msg) {
         } break;
         case FINGERPRINT_RESET_LOCKOUT: {
             ALOGD("onLockoutCleared");
-            clearLockout(true);
+            auto completion = std::atomic_load(&mLockoutResetCompletion);
+            mLockoutTracker.reset(true);
+            if (!completion || !completion->exchange(true)) {
+                mCb->onLockoutCleared();
+            }
         } break;
 #endif
     }
